@@ -1,0 +1,15 @@
+{
+    "name": "ThreadBlacklist",
+    "description": "Automatically deletes new threads that belong to blacklisted users.",
+    "authors": [
+        {
+            "name": "you",
+            "id": "0"
+        }
+    ],
+    "main": "index.js",
+    "vendetta": {
+        "icon": "ic_trash_24px"
+    },
+    "hash": "940f962baa71dc8084dfc4b93469d930b50c3e5eb62c880a3165904761dc0b73"
+}
