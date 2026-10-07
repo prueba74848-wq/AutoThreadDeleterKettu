@@ -9,7 +9,7 @@ function require(id) {
     case "@vendetta/ui/components": return vendetta.ui.components;
     case "@vendetta/storage": return vendetta.storage;
     case "@vendetta/plugin": return vendetta.plugin;
-    default: throw new Error("[ThreadFileDeleter] Unknown module: " + id);
+    default: throw new Error("[ThreadBlacklist] Unknown module: " + id);
   }
 }
 var module = { exports: {} };
@@ -34,7 +34,7 @@ function Settings() {
   const h = common.React.createElement;
   return h(
     FormSection,
-    { title: "Thread File Deleter", android_noDivider: true },
+    { title: "Thread Blacklist", android_noDivider: true },
     h(FormInput, {
       title: "Blacklisted users",
       placeholder: "User IDs or usernames, separated by commas",
@@ -57,11 +57,10 @@ function Settings() {
     h(
       FormText,
       { style: { paddingHorizontal: 16, paddingBottom: 8 } },
-      "Deletes messages that contain file attachments or Google Drive links inside a blacklisted user's thread. " +
-        "Username (with or without @): matches threads whose name is exactly that username. " +
-        "User ID: matches threads owned by that user, and also their cached username against thread names. " +
+      "Username (with or without @): deletes any new thread whose name is exactly that username. " +
+        "User ID: deletes threads owned by that user, and also matches their cached username against thread names. " +
         "If you set a thread channel ID, only threads in that channel are checked. " +
-        "You need the Manage Messages permission. Enable Developer Mode, then long-press a user and use Copy User ID."
+        "You need the Manage Threads permission. Enable Developer Mode, then long-press a user and use Copy User ID."
     )
   );
 }
@@ -69,9 +68,6 @@ function Settings() {
 const norm = (s) => String(s != null ? s : "").toLowerCase();
 const clean = (s) => norm(s).replace(/[^a-z0-9À-￿]/g, "");
 const isId = (s) => /^\d{15,25}$/.test(s);
-
-const GDRIVE_RE = /https?:\/\/(drive|docs)\.google\.com\/\S+/i;
-const THREAD_TYPES = [10, 11, 12];
 
 const handled = new Set();
 
@@ -83,7 +79,7 @@ function toast(text) {
   try {
     toasts.showToast(text, assets.getAssetIDByName("Small"));
   } catch (e) {
-    _vendetta.logger.log("[ThreadFileDeleter] toast failed: " + String(e));
+    _vendetta.logger.log("[ThreadBlacklist] toast failed: " + String(e));
   }
 }
 
@@ -94,20 +90,8 @@ function getEntries() {
     .filter(Boolean);
 }
 
-function getChannel(channelId) {
-  try {
-    const ChannelStore = metro.findByProps("getChannel", "getMutableGuildChannelsForGuild");
-    return ChannelStore && ChannelStore.getChannel ? ChannelStore.getChannel(channelId) : null;
-  } catch (e) {
-    _vendetta.logger.log("[ThreadFileDeleter] channel lookup failed: " + String(e));
-    return null;
-  }
-}
-
 // Returns a reason string when the thread belongs to a blacklisted user, otherwise null
 function blacklistReason(ch) {
-  if (THREAD_TYPES.indexOf(ch.type) === -1) return null;
-
   const entries = getEntries();
   if (!entries.length) return null;
 
@@ -134,7 +118,7 @@ function blacklistReason(ch) {
       }
     }
   } catch (e) {
-    _vendetta.logger.log("[ThreadFileDeleter] user lookup failed: " + String(e));
+    _vendetta.logger.log("[ThreadBlacklist] user lookup failed: " + String(e));
   }
 
   const threadName = clean(ch.name);
@@ -142,60 +126,48 @@ function blacklistReason(ch) {
   return null;
 }
 
-// Returns a reason string when the message has a file or a Google Drive link, otherwise null
-function offendingReason(msg) {
-  if (msg.attachments && msg.attachments.length > 0) return "attachment";
-  if (msg.content && GDRIVE_RE.test(msg.content)) return "Google Drive link";
-  if (msg.embeds && msg.embeds.length > 0) {
-    for (let i = 0; i < msg.embeds.length; i++) {
-      const e = msg.embeds[i];
-      if (e && e.url && GDRIVE_RE.test(e.url)) return "Google Drive link";
-    }
+function isRecent(id) {
+  try {
+    const created = Number(BigInt(id) >> 22n) + 1420070400000;
+    return Date.now() - created < 2 * 60 * 1000;
+  } catch (e) {
+    return true;
   }
-  return null;
 }
 
-async function removeMessage(channelId, messageId, reason) {
-  const label = channelId + "/" + messageId;
+async function removeThread(ch, reason) {
+  const label = ch.name || ch.id;
   if (plugin.storage.dryRun) {
-    _vendetta.logger.log("[ThreadFileDeleter] TEST MODE: would delete " + label + " (" + reason + ")");
-    toast("Test mode: would delete message (" + reason + ")");
+    _vendetta.logger.log("[ThreadBlacklist] TEST MODE: would delete " + ch.id + " (" + reason + ")");
+    toast("Test mode: would delete thread " + label);
     return;
   }
   try {
-    await getRest().del({ url: "/channels/" + channelId + "/messages/" + messageId });
-    _vendetta.logger.log("[ThreadFileDeleter] Deleted " + label + " (" + reason + ")");
-    toast("Deleted message: " + reason);
+    await getRest().del({ url: "/channels/" + ch.id });
+    _vendetta.logger.log("[ThreadBlacklist] Deleted " + ch.id + " (" + reason + ")");
+    toast("Deleted blacklisted thread " + label);
   } catch (e) {
     const status = e && (e.status != null ? e.status : e.response && e.response.status);
-    _vendetta.logger.log("[ThreadFileDeleter] Delete failed (" + status + "): " + String(e && (e.message || (e.body && e.body.message))));
-    toast(status === 403 ? "Can't delete message, missing Manage Messages permission" : "Failed to delete message");
+    _vendetta.logger.log("[ThreadBlacklist] Delete failed (" + status + "): " + String(e && (e.message || (e.body && e.body.message))));
+    toast(status === 403 ? "Can't delete thread, missing Manage Threads permission" : "Failed to delete thread " + label);
   }
 }
 
-function onMessageCreate(ev) {
+function onThreadCreate(ev) {
   try {
-    if (!ev || ev.optimistic) return;
-    const msg = ev.message;
-    if (!msg || !msg.id) return;
-    if (handled.has(msg.id)) return;
+    const ch = ev && ev.channel;
+    if (!ch || !ch.id) return;
+    if (ev.isNewlyCreated === false) return;
+    if (handled.has(ch.id)) return;
+    if (!isRecent(ch.id)) return;
 
-    const channelId = ev.channelId || msg.channel_id;
-    if (!channelId) return;
+    const reason = blacklistReason(ch);
+    if (!reason) return;
 
-    const fileReason = offendingReason(msg);
-    if (!fileReason) return;
-
-    const ch = getChannel(channelId);
-    if (!ch) return;
-
-    const threadReason = blacklistReason(ch);
-    if (!threadReason) return;
-
-    handled.add(msg.id);
-    removeMessage(channelId, msg.id, fileReason + " in thread with " + threadReason);
+    handled.add(ch.id);
+    removeThread(ch, reason);
   } catch (e) {
-    _vendetta.logger.log("[ThreadFileDeleter] handler error: " + String(e));
+    _vendetta.logger.log("[ThreadBlacklist] handler error: " + String(e));
   }
 }
 
@@ -204,13 +176,13 @@ const index = {
     if (plugin.storage.blacklist == null) plugin.storage.blacklist = "";
     if (plugin.storage.threadChannelId == null) plugin.storage.threadChannelId = "";
     if (plugin.storage.dryRun == null) plugin.storage.dryRun = false;
-    common.FluxDispatcher.subscribe("MESSAGE_CREATE", onMessageCreate);
-    _vendetta.logger.log("[ThreadFileDeleter] Loaded.");
+    common.FluxDispatcher.subscribe("THREAD_CREATE", onThreadCreate);
+    _vendetta.logger.log("[ThreadBlacklist] Loaded.");
   },
   onUnload() {
-    common.FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessageCreate);
+    common.FluxDispatcher.unsubscribe("THREAD_CREATE", onThreadCreate);
     handled.clear();
-    _vendetta.logger.log("[ThreadFileDeleter] Unloaded.");
+    _vendetta.logger.log("[ThreadBlacklist] Unloaded.");
   },
   settings: Settings
 };
